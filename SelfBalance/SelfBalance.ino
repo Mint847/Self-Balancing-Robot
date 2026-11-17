@@ -44,6 +44,12 @@ const float I_LIMIT       = 100.0f;                       // max PWM contributed
 const float GYRO_SIGN     = 1.0f;                         // set to -1.0f if Kd makes oscillation WORSE
 const bool  DEBUG_SERIAL  = false;                        // serial prints block the loop; keep off when balancing
 
+// Driving (web D-pad)
+const float DRIVE_SIGN    = 1.0f;     // flip to -1.0f if the "forward" button drives backward
+const float TURN_SIGN     = 1.0f;     // flip to -1.0f if left/right turn the wrong way
+const float DRIVE_ACCEL   = 400.0f;   // how fast the target speed ramps (ticks/s per second)
+const unsigned long DRIVE_TIMEOUT_MS = 300;  // no command for this long -> stop driving (failsafe)
+
 // ==========================================
 // TUNABLE PARAMETERS (floats: atomic between the two cores)
 // ==========================================
@@ -56,6 +62,8 @@ volatile float deadband = 0.0f;  // PWM needed just to make the motors move
 volatile float Kv = 0.30f;       // speed loop: deg of lean per 100 ticks/s  (the anti-drift term)
 volatile float Kt = 0.30f;       // auto-trim rate: how fast the setpoint learns the slope (deg/s per deg of lean). 0 = off
 volatile float Kx = 0.02f;       // position loop: deg of lean per 100 ticks of displacement
+volatile float driveSpeed = 300.0f; // target wheel speed at full forward (ticks/s)
+volatile float turnPower  = 40.0f;  // PWM difference between wheels when turning
 
 // ==========================================
 // STATE
@@ -78,7 +86,12 @@ bool leftOk = true, rightOk = true;  // false = that encoder is dead and is igno
 int leftSign = 1, rightSign = 1;      // encoder direction correction (set by the encoder test)
 
 volatile bool motorEnabled = true;
-bool robotFallen = false;
+volatile bool robotFallen = false;
+
+// Drive commands from the web page (-1..1), with failsafe timestamp
+volatile float driveCmd = 0, turnCmd = 0;
+volatile unsigned long lastDriveMs = 0;
+float speedTarget = 0;                // ramped target wheel speed (ticks/s)
 
 // Requests from the web task, executed by the control loop (keeps I2C/motors on one core)
 volatile bool calRequested = false, calDone = false;
@@ -101,183 +114,328 @@ void IRAM_ATTR isrRightEncoder() {
 }
 
 // ==========================================
-// WEB PAGE
+// WEB PAGE (static; values are loaded by the page from /config)
 // ==========================================
-String paramRow(const char* id, const char* label, const char* desc, float mn, float mx, float val) {
-  String v = String(val, 2), lo = String(mn, 2), hi = String(mx, 2);
-  String s = "<div class='param-label'><strong>" + String(label) + "</strong> <span style='color:#aaa;font-size:0.85em;'>" + String(desc) + "</span></div>";
-  s += "<div class='slider-row'><input type='range' id='" + String(id) + "_s' min='" + lo + "' max='" + hi + "' step='0.01' value='" + v + "' oninput=\"syncFromSlider('" + String(id) + "')\">";
-  s += "<input type='number' class='num-input' id='" + String(id) + "' min='" + lo + "' max='" + hi + "' step='0.01' value='" + v + "' oninput=\"syncFromNumber('" + String(id) + "')\">";
-  s += "<div class='step-btns'><button class='sbtn' onclick=\"step('" + String(id) + "',0.01)\">&#9650;</button>";
-  s += "<button class='sbtn' onclick=\"step('" + String(id) + "',-0.01)\">&#9660;</button></div></div>";
-  return s;
-}
-
-void handleRoot() {
-  String html = R"rawliteral(
+const char PAGE_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset='UTF-8'>
-  <meta name='viewport' content='width=device-width, initial-scale=1'>
-  <title>PID Tuner</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
-    h1 { text-align: center; color: #e94560; margin-bottom: 24px; font-size: 1.4em; }
-    .card { background: #16213e; border-radius: 16px; padding: 20px; margin-bottom: 16px; }
-    .param-label { display: flex; justify-content: space-between; align-items: center; font-size: 0.95em; margin-bottom: 6px; color: #aaa; }
-    .param-label strong { color: #eee; }
-    .slider-row { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
-    .slider-row input[type=range] { flex: 1; accent-color: #e94560; height: 6px; }
-    .num-input { width: 72px; background: #0f3460; border: 1.5px solid #e94560; border-radius: 8px;
-                 color: #e94560; font-size: 1em; font-weight: bold; text-align: center;
-                 padding: 6px 4px; -moz-appearance: textfield; }
-    .num-input::-webkit-inner-spin-button, .num-input::-webkit-outer-spin-button { -webkit-appearance: none; }
-    .num-input:focus { outline: none; border-color: #ff9800; color: #ff9800; }
-    .step-btns { display: flex; flex-direction: column; gap: 3px; }
-    .sbtn { width: 32px; height: 28px; background: #0f3460; border: 1.5px solid #555;
-            border-radius: 7px; color: #eee; font-size: 1em; font-weight: bold;
-            cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0;
-            touch-action: manipulation; user-select: none; -webkit-user-select: none; }
-    .sbtn:active { background: #e94560; border-color: #e94560; color: white; }
-    .btn { display: block; width: 100%; padding: 16px; background: #e94560; color: white;
-           border: none; border-radius: 12px; font-size: 1.1em; font-weight: bold;
-           cursor: pointer; margin-top: 8px; }
-    .btn:active { background: #c73652; }
-    .btn-stop { background: #ff5722; }
-    .btn-resume { background: #4caf50; }
-    .btn-recal { background: #ff9800; }
-    .btn-enc { background: #2196f3; }
-    .status { text-align: center; color: #4caf50; margin-top: 12px; font-size: 0.9em; min-height: 20px; }
-    .pitch-box { text-align: center; background: #0f3460; border-radius: 12px; padding: 14px; margin-bottom: 16px; }
-    .pitch-val { font-size: 2.5em; font-weight: bold; color: #e94560; }
-    .pitch-label { font-size: 0.8em; color: #aaa; margin-top: 4px; }
-    .stopped-banner { text-align:center; background:#ff5722; border-radius:10px; padding:10px; margin-bottom:14px; font-weight:bold; display:none; }
-    .hint { color:#888; font-size:0.8em; margin-bottom:14px; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0f17">
+<title>Balance Bot</title>
+<style>
+:root{--bg:#0b0f17;--card:#121826;--card2:#182033;--line:#253048;--text:#e7ecf5;--muted:#8b97ad;
+--accent:#4f8cff;--accent2:#7aa7ff;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--r:16px}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{background:var(--bg);color:var(--text);font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+body{padding-bottom:96px}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;
+padding:14px 16px;background:rgba(11,15,23,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
+.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),#9b6bff);display:grid;place-items:center;font-size:15px}
+.status{display:flex;align-items:center;gap:10px}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--bad);box-shadow:0 0 0 3px rgba(239,68,68,.2);transition:.3s}
+.dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(34,197,94,.2)}
+.pill{font-size:12px;font-weight:700;letter-spacing:.06em;padding:5px 10px;border-radius:999px;background:var(--card2);color:var(--muted)}
+.pill.ok{background:rgba(34,197,94,.15);color:var(--ok)}.pill.warn{background:rgba(245,158,11,.15);color:var(--warn)}
+.pill.bad{background:rgba(239,68,68,.15);color:var(--bad)}.pill.drive{background:rgba(79,140,255,.18);color:var(--accent2)}
+main{max-width:560px;margin:0 auto;padding:16px;display:grid;gap:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:12px;font-weight:700}
+.live-top{display:flex;align-items:center;gap:12px}
+.tilt{width:130px;height:100px;flex:none}
+.ground{stroke:var(--line);stroke-width:2}.tline{stroke:var(--warn);stroke-width:1.5;stroke-dasharray:3 3}
+.body{fill:var(--accent)}.face{fill:#0b0f17}.wheel{fill:#2b3550;stroke:var(--accent2);stroke-width:2}
+.pitchbox{flex:1;text-align:right}
+.lbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.big{font-size:44px;font-weight:800;line-height:1.05;font-variant-numeric:tabular-nums}
+.sub{color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+.tile{background:var(--card2);border-radius:12px;padding:10px 8px;text-align:center;min-width:0}
+.tile b{display:block;font-size:17px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.mbar{height:4px;background:var(--line);border-radius:2px;margin-top:6px;position:relative;overflow:hidden}
+.mbar i{position:absolute;top:0;bottom:0;background:var(--accent);left:50%;width:0}
+.enc{margin-top:10px;font-size:12px;color:var(--muted);text-align:center;font-variant-numeric:tabular-nums}
+.pad{display:grid;grid-template-columns:repeat(3,76px);grid-template-rows:repeat(3,76px);gap:10px;justify-content:center;margin:4px 0 14px;touch-action:none;user-select:none;-webkit-user-select:none}
+.pb{border:1px solid var(--line);background:var(--card2);color:var(--text);border-radius:18px;font-size:28px;display:grid;place-items:center;cursor:pointer;touch-action:none;transition:transform .06s,background .1s}
+.pb.on{background:var(--accent);border-color:var(--accent);transform:scale(.95);box-shadow:0 0 22px rgba(79,140,255,.45)}
+.pb.mid{font-size:13px;font-weight:800;letter-spacing:.06em;color:var(--muted)}
+.pb.mid:active{background:var(--line)}
+.u{grid-area:1/2}.l{grid-area:2/1}.m{grid-area:2/2}.r{grid-area:2/3}.d{grid-area:3/2}
+.hint{text-align:center;font-size:12px;color:var(--muted);margin-bottom:12px}
+.row{padding:10px 0;border-top:1px solid var(--line)}.row:first-child{border-top:0}
+.rl{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.rn{font-weight:700}.rd{font-size:12px;color:var(--muted)}
+.rc{display:flex;align-items:center;gap:8px}
+input[type=range]{flex:1;min-width:0;accent-color:var(--accent);height:28px}
+.num{width:76px;background:var(--bg);border:1px solid var(--line);border-radius:10px;color:var(--text);font-weight:600;font-size:15px;font-family:inherit;text-align:center;padding:8px 4px;-moz-appearance:textfield;font-variant-numeric:tabular-nums}
+.num:focus{outline:none;border-color:var(--accent)}
+.num.dirty{border-color:var(--warn);color:var(--warn)}
+.num::-webkit-inner-spin-button,.num::-webkit-outer-spin-button{-webkit-appearance:none}
+.sb{width:34px;height:34px;flex:none;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--text);font-size:18px;cursor:pointer;touch-action:manipulation}
+.sb:active{background:var(--accent)}
+details.card{padding:0}
+details summary{list-style:none;cursor:pointer;padding:16px;display:flex;justify-content:space-between;align-items:center}
+details summary::-webkit-details-marker{display:none}
+details summary h2{margin:0}
+details summary:after{content:"\25BE";color:var(--muted);transition:.2s}
+details[open] summary:after{transform:rotate(180deg)}
+details .inner{padding:0 16px 8px}
+.btn{width:100%;border:0;border-radius:12px;padding:14px;font-weight:700;font-size:15px;font-family:inherit;cursor:pointer;color:#fff;background:var(--card2);border:1px solid var(--line)}
+.btn:disabled{opacity:.5}
+.btn.stop{background:var(--bad);border-color:var(--bad)}
+.btn.go{background:var(--ok);border-color:var(--ok)}
+.btn.blue{background:var(--accent);border-color:var(--accent)}
+.sys{display:grid;gap:10px}
+.note{font-size:12px;color:var(--muted);margin-top:-2px}
+.res{font-size:13px;color:var(--accent2);min-height:1em}
+.savebar{position:fixed;left:0;right:0;bottom:0;z-index:6;padding:12px 16px calc(12px + env(safe-area-inset-bottom));
+background:rgba(18,24,38,.97);border-top:1px solid var(--line);display:flex;gap:10px;align-items:center;justify-content:center;
+transform:translateY(110%);transition:transform .25s}
+.savebar.show{transform:none}
+.savebar span{flex:1;max-width:240px;color:var(--warn);font-weight:600;font-size:14px}
+.savebar .btn{width:auto;padding:12px 16px}
+.toast{position:fixed;left:50%;top:70px;transform:translate(-50%,-20px);opacity:0;z-index:9;background:var(--card2);border:1px solid var(--line);
+padding:10px 16px;border-radius:12px;font-weight:600;transition:.25s;pointer-events:none}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:380px){.pad{grid-template-columns:repeat(3,68px);grid-template-rows:repeat(3,68px)}.big{font-size:36px}.stats{grid-template-columns:repeat(2,1fr)}}
+</style>
 </head>
 <body>
-  <h1>&#9881; PID Tuner</h1>
+<header>
+  <div class="brand"><div class="logo">&#9881;</div>Balance Bot</div>
+  <div class="status"><span id="pill" class="pill">CONNECTING</span><span id="dot" class="dot"></span></div>
+</header>
 
-  <div class='pitch-box'>
-    <div class='pitch-val' id='pitchVal'>--</div>
-    <div class='pitch-label'>Current Pitch (degrees)</div>
-    <div style='margin-top:8px;font-size:0.85em;color:#4caf50;' id='tele'>--</div>
-  </div>
+<main>
+  <section class="card">
+    <div class="live-top">
+      <svg class="tilt" viewBox="-60 -72 120 90" aria-label="Tilt indicator (exaggerated)">
+        <line class="ground" x1="-58" y1="12" x2="58" y2="12"/>
+        <g id="tgtG"><line class="tline" x1="0" y1="6" x2="0" y2="-66"/></g>
+        <g id="bot">
+          <rect class="body" x="-10" y="-54" width="20" height="56" rx="6"/>
+          <rect class="face" x="-6" y="-47" width="12" height="9" rx="3"/>
+          <circle class="wheel" cx="0" cy="5" r="7"/>
+        </g>
+      </svg>
+      <div class="pitchbox">
+        <div class="lbl">Pitch</div>
+        <div class="big" id="pitch">--</div>
+        <div class="sub">target <span id="tgt">--</span>&deg;</div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="tile"><b id="spd">--</b><span>Speed t/s</span></div>
+      <div class="tile"><b id="mot">--</b><span>Motor</span><div class="mbar"><i id="mbar"></i></div></div>
+      <div class="tile"><b id="trim">--</b><span>Trim &deg;</span></div>
+      <div class="tile"><b id="err">--</b><span>Error &deg;</span></div>
+    </div>
+    <div class="enc">Encoders &nbsp;L <span id="encL">--</span> &nbsp;&middot;&nbsp; R <span id="encR">--</span></div>
+  </section>
 
-  <div class='card'>
-    <h3 style='color:#e94560;margin-bottom:12px;font-size:1.05em;'>&#9881; Balance Controller (Inner Loop)</h3>
-)rawliteral";
+  <section class="card">
+    <h2>Drive</h2>
+    <div class="pad" id="pad">
+      <button class="pb u" data-dir="up" aria-label="Forward">&#9650;</button>
+      <button class="pb l" data-dir="left" aria-label="Turn left">&#9664;</button>
+      <button class="pb mid m" id="halt" aria-label="Stop driving">STOP</button>
+      <button class="pb r" data-dir="right" aria-label="Turn right">&#9654;</button>
+      <button class="pb d" data-dir="down" aria-label="Backward">&#9660;</button>
+    </div>
+    <div class="hint">Hold to drive &middot; release to stop &middot; arrow keys / WASD on a PC</div>
+    <div id="driveRows"></div>
+    <button class="btn stop" id="motorBtn" style="margin-top:12px">Stop motors</button>
+  </section>
 
-  html += paramRow("kp", "Kp", "Proportional", 0, 100, Kp);
-  html += paramRow("ki", "Ki", "Integral", 0, 10, Ki);
-  html += paramRow("kd", "Kd", "Damping (gyro)", 0, 20, Kd);
-  html += paramRow("sp", "Setpoint", "Neutral Angle (deg)", -15, 15, setpoint);
-  html += paramRow("db", "Deadband", "Min motor PWM", 0, 100, deadband);
+  <details class="card" open>
+    <summary><h2>Balance</h2></summary>
+    <div class="inner" id="balRows"></div>
+  </details>
 
-  html += R"rawliteral(
-  </div>
+  <details class="card">
+    <summary><h2>Anti-drift</h2></summary>
+    <div class="inner"><div class="note" style="margin:0 0 4px">Uses the wheel encoders to stop rolling away and to learn slopes.</div><div id="adRows"></div></div>
+  </details>
 
-  <div class='card'>
-    <h3 style='color:#e94560;margin-bottom:12px;font-size:1.05em;'>&#128640; Anti-Drift Controller (Outer Loop)</h3>
-    <div class='hint'>Uses wheel encoders: if the robot rolls away, it leans back to return. Run the encoder test first (below). Start Kv at 0.30; raise it if it still drifts, lower it if it oscillates slowly. Kx pulls it back to its start spot.</div>
-)rawliteral";
+  <details class="card">
+    <summary><h2>System</h2></summary>
+    <div class="inner sys" style="padding-bottom:16px">
+      <button class="btn blue" id="encBtn">Test encoders</button>
+      <div class="note">Lift the robot first: both wheels spin forward briefly.</div>
+      <div class="res" id="encRes"></div>
+      <button class="btn" id="gyroBtn">Calibrate gyro</button>
+      <div class="note">Robot must be completely still (any angle).</div>
+      <div class="res" id="gyroRes"></div>
+    </div>
+  </details>
+</main>
 
-  html += paramRow("kv", "Kv", "Lean per speed", 0, 3, Kv);
-  html += paramRow("kx", "Kx", "Lean per distance", 0, 1, Kx);
-  html += paramRow("kt", "Auto-trim", "Slope learning rate", 0, 2, Kt);
+<div class="savebar" id="savebar">
+  <span>Unsaved changes</span>
+  <button class="btn" id="revertBtn">Revert</button>
+  <button class="btn blue" id="applyBtn">Apply &amp; Save</button>
+</div>
+<div class="toast" id="toast"></div>
 
-  html += R"rawliteral(
-    <button class='btn' onclick='sendValues()'>&#9654; Apply Values</button>
-    <div class='status' id='status'></div>
-  </div>
+<script>
+var P=[
+ {id:'kp',g:'bal',n:'Kp',d:'Proportional',min:0,max:100,st:0.01},
+ {id:'ki',g:'bal',n:'Ki',d:'Integral',min:0,max:10,st:0.01},
+ {id:'kd',g:'bal',n:'Kd',d:'Damping (gyro)',min:0,max:20,st:0.01},
+ {id:'sp',g:'bal',n:'Setpoint',d:'Balance angle (deg)',min:-15,max:15,st:0.01},
+ {id:'db',g:'bal',n:'Deadband',d:'Min motor PWM',min:0,max:100,st:1},
+ {id:'kv',g:'ad',n:'Kv',d:'Lean per speed',min:0,max:3,st:0.01},
+ {id:'kx',g:'ad',n:'Kx',d:'Lean per distance',min:0,max:1,st:0.01},
+ {id:'kt',g:'ad',n:'Auto-trim',d:'Slope learning rate',min:0,max:2,st:0.01},
+ {id:'ds',g:'drv',n:'Drive speed',d:'ticks/s at full',min:50,max:1000,st:10},
+ {id:'tp',g:'drv',n:'Turn power',d:'PWM difference',min:0,max:150,st:1}
+];
+var byId={},cur={},saved={};
+function $(i){return document.getElementById(i)}
+function dec(p){return p.st>=1?0:2}
+function fmt(p,v){return Number(v).toFixed(dec(p))}
+function toast(t){var e=$('toast');e.textContent=t;e.classList.add('show');clearTimeout(e._t);e._t=setTimeout(function(){e.classList.remove('show')},1800)}
 
-  <div class='stopped-banner' id='stoppedBanner'>&#9888; MOTORS STOPPED</div>
+function build(){
+  var tgt={bal:$('balRows'),ad:$('adRows'),drv:$('driveRows')};
+  P.forEach(function(p){
+    byId[p.id]=p;
+    var r=document.createElement('div');r.className='row';
+    r.innerHTML='<div class="rl"><span class="rn">'+p.n+'</span><span class="rd">'+p.d+'</span></div>'+
+      '<div class="rc"><button class="sb" data-id="'+p.id+'" data-d="-1">&minus;</button>'+
+      '<input type="range" id="'+p.id+'_s" min="'+p.min+'" max="'+p.max+'" step="'+p.st+'">'+
+      '<button class="sb" data-id="'+p.id+'" data-d="1">+</button>'+
+      '<input type="number" class="num" id="'+p.id+'" min="'+p.min+'" max="'+p.max+'" step="'+p.st+'" inputmode="decimal"></div>';
+    tgt[p.g].appendChild(r);
+    $(p.id+'_s').addEventListener('input',function(e){setVal(p.id,e.target.value)});
+    $(p.id).addEventListener('change',function(e){setVal(p.id,e.target.value)});
+  });
+  document.querySelectorAll('.sb').forEach(function(b){
+    b.addEventListener('click',function(){var p=byId[b.dataset.id];setVal(p.id,cur[p.id]+p.st*b.dataset.d)});
+  });
+}
+function setVal(id,v,isSaved){
+  var p=byId[id];v=parseFloat(v);if(isNaN(v))v=cur[id];
+  v=Math.min(p.max,Math.max(p.min,v));v=parseFloat(fmt(p,v));
+  cur[id]=v;if(isSaved)saved[id]=v;
+  $(id).value=fmt(p,v);$(id+'_s').value=v;
+  $(id).classList.toggle('dirty',saved[id]!==v);
+  checkDirty();
+}
+function checkDirty(){
+  var d=P.some(function(p){return saved[p.id]!==cur[p.id]});
+  $('savebar').classList.toggle('show',d);
+}
+function loadConfig(){
+  fetch('/config').then(function(r){return r.json()}).then(function(c){
+    P.forEach(function(p){if(c[p.id]!==undefined)setVal(p.id,c[p.id],true)});
+  }).catch(function(){setTimeout(loadConfig,1500)});
+}
+$('applyBtn').onclick=function(){
+  var q=P.map(function(p){return p.id+'='+cur[p.id]}).join('&');
+  fetch('/set?'+q).then(function(r){if(!r.ok)throw 0;
+    P.forEach(function(p){setVal(p.id,cur[p.id],true)});toast('Saved to robot');
+  }).catch(function(){toast('Save failed - connected?')});
+};
+$('revertBtn').onclick=function(){P.forEach(function(p){setVal(p.id,saved[p.id])})};
 
-  <div class='card'>
-    <button class='btn btn-stop' id='stopBtn' onclick='stopMotors()'>&#9632; Stop Motors</button>
-    <button class='btn btn-resume' id='resumeBtn' onclick='resumeMotors()' style='display:none;margin-top:10px;'>&#9654; Resume Balancing</button>
-  </div>
+/* ---------- Telemetry ---------- */
+var lastOk=0,en=1,fl=0,polling=false;
+function applyState(s){
+  lastOk=Date.now();en=s.en;fl=s.fl;
+  var e=s.p-s.t,rel=s.p-s.sp,trel=s.t-s.sp;
+  $('pitch').textContent=s.p.toFixed(2)+'°';
+  $('tgt').textContent=s.t.toFixed(2);
+  $('spd').textContent=s.s;$('mot').textContent=s.m;
+  $('trim').textContent=s.tr.toFixed(2);$('err').textContent=e.toFixed(2);
+  $('encL').textContent=s.l;$('encR').textContent=s.r;
+  var w=Math.min(50,Math.abs(s.m)/255*50),b=$('mbar');
+  b.style.width=w+'%';b.style.left=(s.m<0?50-w:50)+'%';b.style.background=Math.abs(s.m)>230?'var(--bad)':'var(--accent)';
+  var k=3,cl=function(a){return Math.max(-60,Math.min(60,a*k))};
+  $('bot').setAttribute('transform','rotate('+cl(rel)+' 0 5)');
+  $('tgtG').setAttribute('transform','rotate('+cl(trel)+' 0 5)');
+  var mb=$('motorBtn');
+  mb.textContent=en?'Stop motors':'Resume balancing';mb.className='btn '+(en?'stop':'go');
+  pill();
+}
+function pill(){
+  var p=$('pill'),on=Date.now()-lastOk<1500;
+  $('dot').classList.toggle('on',on);
+  if(!on){p.textContent='OFFLINE';p.className='pill bad';return}
+  if(fl){p.textContent='FALLEN';p.className='pill bad'}
+  else if(!en){p.textContent='STOPPED';p.className='pill warn'}
+  else if(held.size){p.textContent='DRIVING';p.className='pill drive'}
+  else{p.textContent='BALANCING';p.className='pill ok'}
+}
+function poll(){
+  if(driveTimer||polling)return;polling=true;
+  fetch('/state').then(function(r){return r.json()}).then(applyState).catch(function(){})
+  .then(function(){polling=false});
+}
+setInterval(poll,200);setInterval(pill,500);
 
-  <div class='card'>
-    <button class='btn btn-enc' onclick='encTest()'>&#9881; Test Encoders (wheels in the air!)</button>
-    <div class='status' id='encStatus'></div>
-    <div class='hint' style='margin-top:8px;'>Lift the robot so the wheels spin freely. Both wheels spin forward briefly; the encoder directions are detected and saved automatically. Do this once.</div>
-  </div>
+/* ---------- Driving ---------- */
+var held=new Set(),driveTimer=null,inflight=false;
+function fc(){return{f:(held.has('up')?1:0)-(held.has('down')?1:0),t:(held.has('right')?1:0)-(held.has('left')?1:0)}}
+function sendDrive(){
+  if(inflight)return;inflight=true;var c=fc();
+  fetch('/drive?f='+c.f+'&t='+c.t).then(function(r){return r.json()}).then(applyState).catch(function(){})
+  .then(function(){inflight=false});
+}
+function driveUpdate(){
+  document.querySelectorAll('.pb[data-dir]').forEach(function(b){b.classList.toggle('on',held.has(b.dataset.dir))});
+  if(held.size){if(!driveTimer){sendDrive();driveTimer=setInterval(sendDrive,100)}}
+  else{if(driveTimer){clearInterval(driveTimer);driveTimer=null}fetch('/drive?f=0&t=0').catch(function(){})}
+  pill();
+}
+document.querySelectorAll('.pb[data-dir]').forEach(function(b){
+  var dir=b.dataset.dir;
+  b.addEventListener('pointerdown',function(e){e.preventDefault();try{b.setPointerCapture(e.pointerId)}catch(x){}held.add(dir);driveUpdate()});
+  ['pointerup','pointercancel','lostpointercapture'].forEach(function(ev){
+    b.addEventListener(ev,function(){if(held.has(dir)){held.delete(dir);driveUpdate()}});
+  });
+  b.addEventListener('contextmenu',function(e){e.preventDefault()});
+});
+$('halt').addEventListener('pointerdown',function(e){e.preventDefault();held.clear();driveUpdate()});
+var keys={ArrowUp:'up',w:'up',W:'up',ArrowDown:'down',s:'down',S:'down',ArrowLeft:'left',a:'left',A:'left',ArrowRight:'right',d:'right',D:'right'};
+document.addEventListener('keydown',function(e){
+  if(e.target.tagName==='INPUT')return;var d=keys[e.key];if(!d)return;
+  e.preventDefault();if(!held.has(d)){held.add(d);driveUpdate()}
+});
+document.addEventListener('keyup',function(e){var d=keys[e.key];if(d&&held.has(d)){held.delete(d);driveUpdate()}});
+function releaseAll(){if(held.size){held.clear();driveUpdate()}}
+window.addEventListener('blur',releaseAll);
+document.addEventListener('visibilitychange',function(){if(document.hidden)releaseAll()});
 
-  <div class='card'>
-    <button class='btn btn-recal' onclick='calibrateGyro()'>&#8635; Calibrate Gyro (Keep Still)</button>
-    <div class='status' id='recalStatus'></div>
-    <div class='hint' style='margin-top:8px;'>Place the robot completely still at any angle. Saves gyro bias to Flash.</div>
-  </div>
+/* ---------- System ---------- */
+$('motorBtn').onclick=function(){
+  releaseAll();
+  fetch('/stop?state='+(en?0:1)).then(function(){en=en?0:1;toast(en?'Balancing resumed':'Motors stopped')});
+};
+$('encBtn').onclick=function(){
+  if(!confirm('Lift the robot so the wheels spin freely. Run encoder test?'))return;
+  var b=this;b.disabled=true;$('encRes').textContent='Testing...';
+  fetch('/enctest').then(function(r){return r.text()}).then(function(t){$('encRes').textContent=t})
+  .catch(function(){$('encRes').textContent='Test failed'}).then(function(){b.disabled=false});
+};
+$('gyroBtn').onclick=function(){
+  if(!confirm('Keep the robot completely still. Calibrate gyro now?'))return;
+  var b=this;b.disabled=true;$('gyroRes').textContent='Calibrating - keep still...';
+  fetch('/calgyro').then(function(){$('gyroRes').textContent='Gyro calibrated and saved'})
+  .catch(function(){$('gyroRes').textContent='Calibration failed'}).then(function(){b.disabled=false});
+};
 
-  <script>
-    function step(id, delta) {
-      var el = document.getElementById(id);
-      var v = parseFloat(el.value) || 0;
-      v = Math.round((v + delta) * 100) / 100;
-      v = Math.min(parseFloat(el.max), Math.max(parseFloat(el.min), v));
-      el.value = v.toFixed(2);
-      document.getElementById(id + '_s').value = v;
-    }
-    function syncFromNumber(id) {
-      var v = parseFloat(document.getElementById(id).value);
-      if (!isNaN(v)) document.getElementById(id + '_s').value = v;
-    }
-    function syncFromSlider(id) {
-      document.getElementById(id).value = parseFloat(document.getElementById(id + '_s').value).toFixed(2);
-    }
-    function sendValues() {
-      var keys = ['kp','ki','kd','sp','db','kv','kx','kt'];
-      var url = '/set?' + keys.map(function(k){ return k + '=' + parseFloat(document.getElementById(k).value).toFixed(2); }).join('&');
-      fetch(url).then(function(r){ return r.text(); }).then(function(){
-        document.getElementById('status').innerText = '✓ Applied & Saved!';
-        setTimeout(function(){ document.getElementById('status').innerText = ''; }, 3000);
-      }).catch(function(){ document.getElementById('status').innerText = '✗ Failed. Is the robot on?'; });
-    }
-    function stopMotors() {
-      fetch('/stop?state=0').then(function(){
-        document.getElementById('stopBtn').style.display = 'none';
-        document.getElementById('resumeBtn').style.display = 'block';
-        document.getElementById('stoppedBanner').style.display = 'block';
-      });
-    }
-    function resumeMotors() {
-      fetch('/stop?state=1').then(function(){
-        document.getElementById('resumeBtn').style.display = 'none';
-        document.getElementById('stopBtn').style.display = 'block';
-        document.getElementById('stoppedBanner').style.display = 'none';
-      });
-    }
-    function calibrateGyro() {
-      var btn = document.querySelector('.btn-recal');
-      btn.disabled = true; btn.innerText = 'Calibrating...';
-      document.getElementById('recalStatus').innerText = 'Keep robot completely still!';
-      fetch('/calgyro').then(function(){
-        btn.disabled = false; btn.innerText = '↺ Calibrate Gyro (Keep Still)';
-        document.getElementById('recalStatus').innerText = '✓ Gyro bias saved!';
-        setTimeout(function(){ document.getElementById('recalStatus').innerText = ''; }, 3000);
-      });
-    }
-    function encTest() {
-      document.getElementById('encStatus').innerText = 'Testing...';
-      fetch('/enctest').then(function(r){ return r.text(); }).then(function(t){
-        document.getElementById('encStatus').innerText = t;
-      }).catch(function(){ document.getElementById('encStatus').innerText = 'Test failed'; });
-    }
-    setInterval(function(){
-      fetch('/pitch').then(function(r){ return r.text(); }).then(function(t){
-        var p = t.split(',');
-        document.getElementById('pitchVal').innerText = parseFloat(p[0]).toFixed(2) + '°';
-        document.getElementById('tele').innerHTML = 'Speed: ' + p[1] + ' t/s | Target: ' + p[2] + '° | Motor: ' + p[3] + ' | Trim: ' + p[4] + '°<br>Raw encoders  L: ' + p[5] + '  R: ' + p[6];
-      }).catch(function(){});
-    }, 400);
-  </script>
+build();loadConfig();
+</script>
 </body>
 </html>
 )rawliteral";
-  server.send(200, "text/html", html);
+
+void handleRoot() {
+  server.send_P(200, "text/html", PAGE_HTML);
 }
 
 // ==========================================
@@ -292,6 +450,8 @@ void handleSet() {
   if (server.hasArg("kv")) Kv = server.arg("kv").toFloat();
   if (server.hasArg("kx")) Kx = server.arg("kx").toFloat();
   if (server.hasArg("kt")) Kt = server.arg("kt").toFloat();
+  if (server.hasArg("ds")) driveSpeed = constrain(server.arg("ds").toFloat(), 0.0f, 1500.0f);
+  if (server.hasArg("tp")) turnPower  = constrain(server.arg("tp").toFloat(), 0.0f, 255.0f);
 
   prefs.putFloat("v2_kp", Kp);
   prefs.putFloat("v2_ki", Ki);
@@ -301,12 +461,41 @@ void handleSet() {
   prefs.putFloat("v2_kv", Kv);
   prefs.putFloat("v2_kx", Kx);
   prefs.putFloat("v2_kt", Kt);
+  prefs.putFloat("v2_ds", driveSpeed);
+  prefs.putFloat("v2_tp", turnPower);
   server.send(200, "text/plain", "OK");
 }
 
-void handlePitch() {
-  String data = String(pitch, 2) + "," + String((int)filteredSpeed) + "," + String(dynamicSetpoint, 2) + "," + String((int)outputPWM) + "," + String(trim, 2) + "," + String(leftTicks) + "," + String(rightTicks);
-  server.send(200, "text/plain", data);
+String stateJson() {
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"p\":%.2f,\"t\":%.2f,\"sp\":%.2f,\"s\":%d,\"m\":%d,\"tr\":%.2f,\"l\":%ld,\"r\":%ld,\"en\":%d,\"fl\":%d}",
+    (float)pitch, (float)dynamicSetpoint, (float)setpoint, (int)filteredSpeed, (int)outputPWM,
+    (float)trim, (long)leftTicks, (long)rightTicks, motorEnabled ? 1 : 0, robotFallen ? 1 : 0);
+  return String(buf);
+}
+
+void handleState() {
+  server.send(200, "application/json", stateJson());
+}
+
+void handleConfig() {
+  char buf[320];
+  snprintf(buf, sizeof(buf),
+    "{\"kp\":%.2f,\"ki\":%.2f,\"kd\":%.2f,\"sp\":%.2f,\"db\":%.2f,\"kv\":%.2f,\"kx\":%.2f,\"kt\":%.2f,\"ds\":%.0f,\"tp\":%.0f}",
+    (float)Kp, (float)Ki, (float)Kd, (float)setpoint, (float)deadband, (float)Kv, (float)Kx, (float)Kt,
+    (float)driveSpeed, (float)turnPower);
+  server.send(200, "application/json", String(buf));
+}
+
+// Hold-to-drive: the page repeats this every ~100 ms while a button is held
+void handleDrive() {
+  float f = server.hasArg("f") ? server.arg("f").toFloat() : 0.0f;
+  float t = server.hasArg("t") ? server.arg("t").toFloat() : 0.0f;
+  driveCmd = constrain(f, -1.0f, 1.0f);
+  turnCmd  = constrain(t, -1.0f, 1.0f);
+  lastDriveMs = millis();
+  server.send(200, "application/json", stateJson());
 }
 
 void handleStop() {
@@ -349,6 +538,9 @@ void resetControl() {
   outputPWM = 0;
   leftTicks = 0; rightTicks = 0; prevTicks = 0;
   dynamicSetpoint = setpoint;
+  speedTarget = 0;
+  driveCmd = 0;
+  turnCmd = 0;
 }
 
 void saveGyroOffsets() {
@@ -447,12 +639,17 @@ void setup() {
   rightSign = prefs.getInt("v2_rs", 1);
   leftOk    = prefs.getBool("v2_lo", true);
   rightOk   = prefs.getBool("v2_ro", true);
+  driveSpeed = prefs.getFloat("v2_ds", 300.0f);
+  turnPower  = prefs.getFloat("v2_tp", 40.0f);
   dynamicSetpoint = setpoint;
 
   WiFi.softAP(AP_SSID, AP_PASS);
   server.on("/",        handleRoot);
   server.on("/set",     handleSet);
-  server.on("/pitch",   handlePitch);
+  server.on("/state",   handleState);
+  server.on("/pitch",   handleState);   // old name, kept as alias
+  server.on("/config",  handleConfig);
+  server.on("/drive",   handleDrive);
   server.on("/stop",    handleStop);
   server.on("/calgyro", handleCalGyro);
   server.on("/enctest", handleEncTest);
@@ -502,6 +699,9 @@ void loop() {
     return;
   }
 
+  // Drive failsafe: released button, closed tab or lost WiFi -> stop driving
+  if (millis() - lastDriveMs > DRIVE_TIMEOUT_MS) { driveCmd = 0; turnCmd = 0; }
+
   float tilt = pitch - (setpoint + trim);
 
   // 3. Safety states
@@ -542,8 +742,14 @@ void loop() {
 
     filteredSpeed = filteredSpeed * 0.7f + (deltaAvg / sdt) * 0.3f;
 
+    // Ramp the commanded speed so starts/stops are smooth
+    float want = DRIVE_SIGN * driveCmd * driveSpeed;
+    float maxStep = DRIVE_ACCEL * sdt;
+    speedTarget += constrain(want - speedTarget, -maxStep, maxStep);
+    bool driving = fabs(speedTarget) > 1.0f || turnCmd != 0.0f;
+
     float kx = Kx, kv = Kv;
-    if (kx > 0.0001f) {
+    if (kx > 0.0001f && !driving) {        // while driving, don't pull back to the old spot
       posTicks += deltaAvg;
       float lim = MAX_TILT_OFFSET * 100.0f / kx;       // anti-windup: position term alone can't exceed max lean
       posTicks = constrain(posTicks, -lim, lim);
@@ -551,15 +757,17 @@ void loop() {
       posTicks = 0;
     }
 
-    // Moving forward (+) -> lean back (lower target angle), and vice versa
-    float target = (n > 0) ? -(kv * filteredSpeed + kx * posTicks) / 100.0f : 0.0f;
+    // Faster than target (+) -> lean back (lower target angle), and vice versa.
+    // With speedTarget = 0 this is the plain anti-drift loop.
+    float target = (n > 0) ? -(kv * (filteredSpeed - speedTarget) + kx * posTicks) / 100.0f : 0.0f;
     target = constrain(target, -MAX_TILT_OFFSET, MAX_TILT_OFFSET);
     tiltOffset += 0.4f * (target - tiltOffset);        // smooth
 
     // Auto-trim: a lean that is requested persistently means the real balance angle has moved
     // (slope, battery, load). Fold it into the setpoint so the robot re-learns its equilibrium.
     // (only while the balance loop is in control, so a fall/runaway can't wind the trim up)
-    if (fabs(pitch - dynamicSetpoint) < 6.0f) trim += Kt * tiltOffset * sdt;
+    // (paused while driving: a lean to accelerate is not a slope)
+    if (!driving && fabs(pitch - dynamicSetpoint) < 6.0f) trim += Kt * tiltOffset * sdt;
     trim = constrain(trim, -MAX_TRIM, MAX_TRIM);
     dynamicSetpoint = setpoint + trim + tiltOffset;
   }
@@ -579,7 +787,10 @@ void loop() {
     cmd = (u > 0 ? 1.0f : -1.0f) * (db + fabs(u) * (maxPWM - db) / maxPWM);
   }
   outputPWM = cmd;
-  setMotors((int)cmd, (int)cmd);
+
+  // Turning: add a left/right difference on top of the balance command
+  float turn = TURN_SIGN * turnCmd * turnPower;
+  setMotors((int)(cmd + turn), (int)(cmd - turn));
 
   if (DEBUG_SERIAL) {
     static unsigned long lastPrint = 0;
